@@ -133,3 +133,37 @@ def test_load_csv_and_roundtrip(tmp_path: Path):
     df, columns = load_csv(p)
     assert isinstance(df, pd.DataFrame)
     assert list(columns) == ["foo", "bar"]
+
+
+def test_model_metadata_parses_v3_object_structure():
+    """ModelMetadata should parse FAIRmodels v3 object-shaped metadata values."""
+    metadata_content = {
+        "General Model Information": {
+            "Title": {"@value": "Rectum-pCR-Prediction-Clinical"},
+            "Editor Note": {"@value": "Clinical variables only"},
+            "Created by": {"@value": "Johan van Soest"},
+            "Contact email": {"@value": "j.vansoest@maastrichtuniversity.nl"},
+            "References to papers": [{"@value": "https://doi.org/10.1016/j.radonc.2010.12.002"}],
+            "FAIRmodels image name": {"@value": "ghcr.io/example/model:latest"},
+        },
+        "Input data1": [
+            {
+                "Input feature": {
+                    "@id": "http://example.org/feature",
+                    "rdfs:label": {"@value": "Tumor Length"},
+                },
+                "Description": {"@value": "Tumor Length in cm"},
+                "Input label": {"@value": "tLength"},
+                "Type of input": {"@value": "numerical"},
+            }
+        ],
+        "Outcome label": {"@value": "pCR"},
+    }
+
+    metadata = ModelMetadata(metadata_content)
+
+    assert metadata.model_name == "Rectum-pCR-Prediction-Clinical"
+    assert metadata.docker_image == "ghcr.io/example/model:latest"
+    assert metadata.output == "pCR"
+    assert metadata.inputs[0].input_label == "tLength"
+    assert metadata.inputs[0].rdfs_label == "Tumor Length"
