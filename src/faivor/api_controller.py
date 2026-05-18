@@ -393,14 +393,6 @@ async def validate_model(
                     technical_details=error_msg,
                     metadata={"model_name": model_name, "timeout": "300s"}
                 ) from e
-            elif "docker" in error_msg.lower() or "container" in error_msg.lower():
-                raise create_error_response(
-                    status_code=503,
-                    error_code="CONTAINER_EXECUTION_ERROR",
-                    message="Failed to execute model in Docker container",
-                    technical_details=error_msg,
-                    metadata={"model_name": model_name}
-                ) from e
             elif "status code 4" in error_msg.lower() or "prediction failed" in error_msg.lower():
                 # Model execution failed (status 4) - likely a data processing error within the model
                 raise create_error_response(
@@ -415,6 +407,14 @@ async def validate_model(
                                        "This may be due to invalid values, missing data, or data format issues. "
                                        "Check the technical details below for more information."
                     }
+                ) from e
+            elif "docker" in error_msg.lower() or "container" in error_msg.lower():
+                raise create_error_response(
+                    status_code=503,
+                    error_code="CONTAINER_EXECUTION_ERROR",
+                    message="Failed to execute model in Docker container",
+                    technical_details=error_msg,
+                    metadata={"model_name": model_name}
                 ) from e
             else:
                 raise create_error_response(

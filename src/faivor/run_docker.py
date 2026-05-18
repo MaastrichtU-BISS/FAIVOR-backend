@@ -300,26 +300,40 @@ def request_prediction(base_url: str, payload: list[dict[str, Any]], timeout: in
                 f"Model response: {error_body[:1000]}"
             )
 
-def get_status_code(base_url: str) -> int:
+def get_status_info(base_url: str) -> Tuple[int, str]:
     """
-    Retrieve the current model status code from /status.
+    Retrieve model status code and status message from /status.
 
-    The endpoint is expected to return JSON of the form:
+    Supports both:
       {"status": <int>, "message": <str>}
+    and:
+      {"status": {"code": <int>, "message": <str>}}
     """
     resp = requests.get(f"{base_url}/status")
     if resp.ok:
         try:
             data = resp.json()
-            code = data.get("status", -1)
-            msg = data.get("message", "")
-            logging.debug("Status code: %d, message: %s", code, msg)
-            return code
+            status = data.get("status", -1)
+            message = data.get("message", "")
+
+            if isinstance(status, dict):
+                code = status.get("code", -1)
+                message = status.get("message", message)
+            else:
+                code = status
+
+            try:
+                code = int(code)
+            except (TypeError, ValueError):
+                code = -1
+
+            logging.debug("Status code: %s, message: %s", code, message)
+            return code, str(message) if message is not None else ""
         except Exception as ex:
             logging.warning("Could not parse JSON from /status: %s", ex)
     else:
         logging.warning("/status request failed with code %d.", resp.status_code)
-    return -1
+    return -1, ""
 
 def retrieve_result(base_url: str) -> list[float]:
     """
@@ -442,19 +456,28 @@ def execute_model(metadata: Any, input_payload: list[dict[str, Any]], timeout = 
                     ) from e
 
         start_time = time.time()
+        failed_status_count = 0
         while time.time() - start_time < timeout:
-            code = get_status_code(base_url)
+            code, status_message = get_status_info(base_url)
             if code == 3:
                 val = retrieve_result(base_url)
                 logging.debug("Final numeric result: %s", val)
                 return {"predictions": val, "docker_image_sha256": image_sha256}
             elif code == 4:
-                # Try to get more error details from container logs
-                logs = container.logs(tail=50).decode(errors="ignore")
-                raise RuntimeError(
-                    f"Model execution failed (status code 4). "
-                    f"Container logs:\n{logs}"
-                )
+                # Some model servers briefly report failure while the result can still be fetched.
+                # Try reading the result first, then require repeated failed states before raising.
+                try:
+                    val = retrieve_result(base_url)
+                    logging.warning("Status endpoint returned 4 but /result succeeded; using returned result.")
+                    return {"predictions": val, "docker_image_sha256": image_sha256}
+                except Exception:
+                    failed_status_count += 1
+                    if failed_status_count >= 3:
+                        logs = container.logs(tail=100).decode(errors="ignore")
+                        detail = f"Model execution failed (status code 4)."
+                        if status_message:
+                            detail += f" Status message: {status_message}."
+                        raise RuntimeError(f"{detail} Container logs:\n{logs}")
             elif code == 0:
                 raise RuntimeError(
                     "Model did not process the prediction request. "
