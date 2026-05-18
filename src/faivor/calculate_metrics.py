@@ -77,6 +77,9 @@ class MetricsCalculator:
                     if true_val not in ('x', 'X', ''):
                         true_float = float(true_val)
                         pred_float = float(pred)
+
+                        if not np.isfinite(true_float) or not np.isfinite(pred_float):
+                            continue
                         
                         valid_indices.append(i)
                         y_true_values.append(true_float)
