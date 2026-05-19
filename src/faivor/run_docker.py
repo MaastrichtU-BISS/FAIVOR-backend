@@ -1,5 +1,6 @@
 import logging
 import os
+import math
 import docker
 import requests
 import socket
@@ -300,26 +301,40 @@ def request_prediction(base_url: str, payload: list[dict[str, Any]], timeout: in
                 f"Model response: {error_body[:1000]}"
             )
 
-def get_status_code(base_url: str) -> int:
+def get_status_info(base_url: str) -> Tuple[int, str]:
     """
-    Retrieve the current model status code from /status.
+    Retrieve model status code and status message from /status.
 
-    The endpoint is expected to return JSON of the form:
+    Supports both:
       {"status": <int>, "message": <str>}
+    and:
+      {"status": {"code": <int>, "message": <str>}}
     """
     resp = requests.get(f"{base_url}/status")
     if resp.ok:
         try:
             data = resp.json()
-            code = data.get("status", -1)
-            msg = data.get("message", "")
-            logging.debug("Status code: %d, message: %s", code, msg)
-            return code
+            status = data.get("status", -1)
+            message = data.get("message", "")
+
+            if isinstance(status, dict):
+                code = status.get("code", -1)
+                message = status.get("message", message)
+            else:
+                code = status
+
+            try:
+                code = int(code)
+            except (TypeError, ValueError):
+                code = -1
+
+            logging.debug("Status code: %s, message: %s", code, message)
+            return code, str(message) if message is not None else ""
         except Exception as ex:
             logging.warning("Could not parse JSON from /status: %s", ex)
     else:
         logging.warning("/status request failed with code %d.", resp.status_code)
-    return -1
+    return -1, ""
 
 def retrieve_result(base_url: str) -> list[float]:
     """
@@ -342,26 +357,49 @@ def retrieve_result(base_url: str) -> list[float]:
 
     try:
         data = resp.json()
-        return parse_ordered_response(data)
+        parsed = parse_ordered_response(data)
+        if not parsed:
+            raise RuntimeError("Model returned an empty result payload")
+        return parsed
     except Exception as ex:
         raise RuntimeError(f"Failed to parse result from /result: {ex}")
 
 
 
-def parse_ordered_response(data: dict) -> List[float]:
+def parse_ordered_response(data: Any) -> List[float]:
     """
     Parse API response with keys that may have prefixes like 'prediction_0'
     """
-    # check if keys have a prefix like 'prediction_'
-    if any(not key.isdigit() for key in data.keys()):
-        # extract numbers from keys like 'prediction_0' (not sure whether we need a more robust way to deal wtth schema or this is fine. TODO: need to discuss with vedran)
-        result = []
-        for key in sorted(data.keys(), key=lambda k: int(k.split('_')[-1]) if '_' in k else int(k)):
-            result.append(data[key])
-        return result
-    else:
-        # Original behavior for simple numeric keys
-        return [data[str(i)] for i in sorted(map(int, data.keys()))]
+    # Direct list payload
+    if isinstance(data, list):
+        return [float(v) for v in data]
+
+    # Wrapped payloads seen in some model APIs
+    if isinstance(data, dict):
+        for key in ("predictions", "prediction", "result", "outputs", "data"):
+            if key in data:
+                return parse_ordered_response(data[key])
+
+        if not data:
+            return []
+
+        keys = list(data.keys())
+
+        # Numeric-indexed payload: {"0": ..., "1": ...}
+        if all(str(k).isdigit() for k in keys):
+            return [float(data[str(i)]) for i in sorted(int(k) for k in keys)]
+
+        # Prefixed payload: {"prediction_0": ..., "prediction_1": ...}
+        indexed_pairs: List[Tuple[int, Any]] = []
+        for key in keys:
+            suffix = str(key).split("_")[-1]
+            if suffix.isdigit():
+                indexed_pairs.append((int(suffix), data[key]))
+
+        if indexed_pairs:
+            return [float(value) for _, value in sorted(indexed_pairs, key=lambda pair: pair[0])]
+
+    raise RuntimeError("Unsupported /result payload format")
 
 def stop_docker_container(container: docker.models.containers.Container) -> None:
     """
@@ -374,6 +412,40 @@ def stop_docker_container(container: docker.models.containers.Container) -> None
     """
     logging.debug("Stopping container...")
     container.stop()
+
+
+def _run_row_wise_fallback(base_url: str, input_payload: list[dict[str, Any]], timeout: int) -> List[float]:
+    """
+    Fallback execution path for model servers that fail on batch payloads.
+
+    Executes one sample at a time and keeps output length aligned with inputs by
+    inserting NaN for rows that fail.
+    """
+    predictions: List[float] = []
+    per_row_timeout = max(10, min(timeout, 30))
+
+    for idx, sample in enumerate(input_payload):
+        try:
+            request_prediction(base_url, [sample], per_row_timeout)
+
+            start = time.time()
+            while time.time() - start < per_row_timeout:
+                code, _ = get_status_info(base_url)
+                if code == 3:
+                    row_result = retrieve_result(base_url)
+                    predictions.append(float(row_result[0]) if row_result else math.nan)
+                    break
+                if code == 4:
+                    predictions.append(math.nan)
+                    break
+                time.sleep(0.25)
+            else:
+                predictions.append(math.nan)
+        except Exception as ex:
+            logging.warning("Row-wise fallback failed for sample %d: %s", idx, ex)
+            predictions.append(math.nan)
+
+    return predictions
 
 def execute_model(metadata: Any, input_payload: list[dict[str, Any]], timeout = 360) -> dict:
     """
@@ -442,19 +514,39 @@ def execute_model(metadata: Any, input_payload: list[dict[str, Any]], timeout = 
                     ) from e
 
         start_time = time.time()
+        failed_status_count = 0
         while time.time() - start_time < timeout:
-            code = get_status_code(base_url)
+            code, status_message = get_status_info(base_url)
             if code == 3:
                 val = retrieve_result(base_url)
                 logging.debug("Final numeric result: %s", val)
                 return {"predictions": val, "docker_image_sha256": image_sha256}
             elif code == 4:
-                # Try to get more error details from container logs
-                logs = container.logs(tail=50).decode(errors="ignore")
-                raise RuntimeError(
-                    f"Model execution failed (status code 4). "
-                    f"Container logs:\n{logs}"
-                )
+                # Some model servers briefly report failure while the result can still be fetched.
+                # Try reading the result first, then require repeated failed states before raising.
+                try:
+                    val = retrieve_result(base_url)
+                    if val:
+                        logging.warning("Status endpoint returned 4 but /result succeeded; using returned result.")
+                        return {"predictions": val, "docker_image_sha256": image_sha256}
+                except Exception:
+                    pass
+
+                failed_status_count += 1
+                if failed_status_count >= 3:
+                    logging.warning(
+                        "Batch prediction failed with status 4; trying row-wise fallback for %d samples.",
+                        len(input_payload),
+                    )
+                    row_wise_predictions = _run_row_wise_fallback(base_url, input_payload, timeout)
+                    if any(not math.isnan(pred) for pred in row_wise_predictions):
+                        return {"predictions": row_wise_predictions, "docker_image_sha256": image_sha256}
+
+                    logs = container.logs(tail=100).decode(errors="ignore")
+                    detail = "Model execution failed (status code 4)."
+                    if status_message:
+                        detail += f" Status message: {status_message}."
+                    raise RuntimeError(f"{detail} Container logs:\n{logs}")
             elif code == 0:
                 raise RuntimeError(
                     "Model did not process the prediction request. "
