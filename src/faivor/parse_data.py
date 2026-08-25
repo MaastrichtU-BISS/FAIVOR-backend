@@ -83,11 +83,44 @@ def detect_delimiter(csv_path: Path) -> str:
     IOError
         If the file cannot be opened.
     """
+    candidate_delimiters = ";,\t|"
     try:
         with open(csv_path, "r", encoding="utf-8") as f:
-            sample = f.read(1024)
-            dialect = csv.Sniffer().sniff(sample, delimiters=";,\t|")
+            # A fixed byte count can truncate the sample before it contains
+            # at least two complete rows, which makes csv.Sniffer() unable
+            # to reliably count delimiter occurrences (e.g. wide CSVs with
+            # many columns or long values). Read enough complete lines
+            # instead of a fixed number of bytes, capping the total size
+            # read to avoid loading an entire huge file into memory.
+            lines = []
+            total_bytes = 0
+            max_bytes = 1024 * 100  # generous cap, ~100 lines worth for wide CSVs
+            min_lines = 2
+            for line in f:
+                lines.append(line)
+                total_bytes += len(line.encode("utf-8"))
+                if len(lines) >= min_lines and total_bytes >= 1024:
+                    break
+                if total_bytes >= max_bytes:
+                    break
+            sample = "".join(lines)
+
+        if not sample:
+            raise IOError("CSV file is empty")
+
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=candidate_delimiters)
             return dialect.delimiter
+        except csv.Error:
+            # Fall back to manually counting delimiter occurrences on the
+            # first line: pick whichever candidate delimiter appears most
+            # often, as long as it appears at least once.
+            first_line = lines[0] if lines else sample
+            counts = {d: first_line.count(d) for d in candidate_delimiters}
+            best_delim, best_count = max(counts.items(), key=lambda kv: kv[1])
+            if best_count > 0:
+                return best_delim
+            raise
     except (FileNotFoundError, IOError) as e:
         raise IOError(f"Could not open CSV file: {e}") from e
 
