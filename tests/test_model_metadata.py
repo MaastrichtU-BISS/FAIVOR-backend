@@ -116,6 +116,40 @@ def test_detect_delimiter_various(tmp_path: Path, content: str, expected: str):
     p.write_text(content, encoding="utf-8")
     assert detect_delimiter(p) == expected
 
+
+def test_detect_delimiter_wide_csv_many_columns(tmp_path: Path):
+    """detect_delimiter must not fail on a wide, comma-delimited CSV whose
+    header and first data row together exceed the old fixed 1024-byte
+    sniffing sample, cutting the sample off mid-row (regression test for
+    the 'Could not determine delimiter' bug on wide CSVs)."""
+    ncols = 40
+    header = ",".join(f"c{i}" for i in range(ncols))
+    row = ",".join(f"value_number_{i:04d}_padding_xxxxxxxx" for i in range(ncols))
+    content = header + "\n" + (row + "\n") * 3
+    # sanity check this really would have truncated mid-row under the old
+    # fixed 1024-byte sample
+    assert "\n" in content.encode("utf-8")[:1024].decode("utf-8", errors="ignore")
+    assert len(content.encode("utf-8")) > 1024
+
+    p = tmp_path / "wide.csv"
+    p.write_text(content, encoding="utf-8")
+    assert detect_delimiter(p) == ","
+
+
+def test_detect_delimiter_wide_csv_semicolon(tmp_path: Path):
+    """Same wide-CSV truncation scenario, but with a non-comma delimiter,
+    to make sure the fix is not comma-specific."""
+    ncols = 40
+    header = ";".join(f"c{i}" for i in range(ncols))
+    row = ";".join(f"value_number_{i:04d}_padding_xxxxxxxx" for i in range(ncols))
+    content = header + "\n" + (row + "\n") * 3
+    assert len(content.encode("utf-8")) > 1024
+
+    p = tmp_path / "wide_semicolon.csv"
+    p.write_text(content, encoding="utf-8")
+    assert detect_delimiter(p) == ";"
+
+
 def test_load_csv(tmp_path: Path):
     """load_csv should return DataFrame."""
     content = "foo,bar\n10,20\n"
